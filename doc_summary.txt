@@ -1,0 +1,356 @@
+----- Trading PLT.docx -----
+Trading Strategy Builder — Architecture v2
+Date: October 26, 2025
+1. Overview
+A modular EA architecture centered on a Runtime Kernel (control plane) coordinating market data, signal generation, risk, portfolio constraints, execution, and post-fill lifecycle management. The loop always handles exits/modifications first (risk reduction) and entries second (risk addition). Execution/OMS is the single source of truth for the broker state. Position Manager is the single authority for managing open trades. State Manager produces health/metrics and flags; the Kernel applies gates (Spread / Session / Pause / Daily-DD / Error-storm).
+Design principles &amp; invariants:
+Single source of truth for orders/positions: Execution/OMS.
+Exit before Entry on every loop (per symbol).
+Pause blocks new entries; Position Manager continues to manage open trades.
+Kill flattens immediately; all actions check Kill before executing.
+Trailing is tighten-only with min-move &amp; throttle; respect freeze/stop-level distances.
+Reverse = close-then-open (NETTING-safe); HEDGING behavior is configurable.
+Event-driven state: State Manager updates immediately on Execution events (not only at loop start).
+Atomic management: Position Manager locks a symbol, executes actions sequentially with reconcile after each, then unlocks.
+Bracket gap protection: defer SL/TP when StopLevel prevents attach; PM re-arms brackets post-fill.
+Unified message vocabulary; single Logger function used by all blocks.
+2. Core Runtime Blocks
+2.1 Runtime Kernel (aka Orchestrator / Runtime Kernel)
+Purpose: Control plane; runs the loop, applies gates, orders steps, coordinates blocks, provides a lightweight logger.
+Responsibilities:
+Loop cadence (tick/bar) and sequencing: Reconcile → Manage Open → New Entries → Record.
+Gate evaluation via State flags: Spread / Session / Pause / Daily-DD / Error-storm.
+Global actions: Pause (block entries, still manage open trades), Kill (flatten now).
+Provide Logger function (single schema/sink).
+Inputs:
+State Manager: HealthFlags (DD%, margin, error counts, connection).
+Execution/OMS: PositionSnapshot, OrderSnapshot, ReconciliationReport.
+Market Data &amp; Platform: Bar/Tick, Spread, SessionStatus.
+Outputs:
+Call order and routing decisions; Pause/Kill control; log events.
+Rules &amp; Guarantees:
+Gates applied twice: (a) before PM — only Kill can block PM; (b) before Entry — all gates enforced.
+Kill is checked by Kernel, PM, and Execution entry points for immediate effect.
+Implementation Notes:
+Logger events: GATE_SKIP, KILL_ON/OFF, PAUSE_TOGGLE, STEP_TIMING, ERROR_SUMMARY.
+2.2 Market Data &amp; Platform
+Purpose: Normalized market conditions; no broker order/position state.
+Responsibilities:
+Provide Bar/Tick streams, Spread, SessionStatus, and InstrumentInfo (point, tick size, StopLevel, FreezeLevel).
+Expose AccountMode (NETTING | HEDGING) via account properties.
+Inputs:
+MQL5 Porting Layer (adapter).
+Outputs:
+Bar
+Tick
+Spread
+SessionStatus
+InstrumentInfo
+AccountMode
+Rules &amp; Guarantees:
+No direct access to orders/positions (Execution is the sole truth).
+2.3 Entry Signal Generator
+Purpose: Proposes new entries only.
+Responsibilities:
+Detect setups and emit EntrySignal[] with symbol, direction, confidence, tags.
+Inputs:
+Latest Bar/Tick (optional context from State Manager).
+Outputs:
+EntrySignal[]
+Rules &amp; Guarantees:
+No sizing/portfolio/broker I/O; stateless across ticks except its own internal buffers if needed.
+2.4 Exit Signal Generator
+Purpose: Advises exits/reversals; Position Manager decides &amp; acts.
+Responsibilities:
+Evaluate exit/reverse logic using price and position context.
+Inputs:
+Bars/Ticks
+Position context (side, qty, avg price)
+Outputs:
+ExitAdvice
+ReverseAdvice
+Rules &amp; Guarantees:
+No direct broker actions; advisory only.
+2.5 Risk Management
+Purpose: Convert EntrySignal[] into executable Order Intent[].
+Responsibilities:
+Size positions; compute initial SL/TP; choose order type; set Intent TTL; tag intents.
+Validate min/max lot, step sizes, minimum risk/reward; drop malformed intents.
+Inputs:
+EntrySignal[]
+InstrumentInfo (steps/lot/StopLevel)
+Optional State context
+Outputs:
+OrderIntent[]
+Rules &amp; Guarantees:
+No portfolio enforcement; no trailing; no broker I/O.
+2.6 Portfolio
+Purpose: Approve, prune, and prioritize intents vs exposure/capacity.
+Responsibilities:
+MVP: one-position-per-symbol; global MaxConcurrentPositions.
+Select best intent by confidence if multiple fire simultaneously when flat.
+Inputs:
+OrderIntent[]
+Current exposure snapshot (from Execution/State).
+Outputs:
+ApprovedIntent[]
+Rules &amp; Guarantees:
+No sizing; no broker I/O.
+Implementation Notes:
+Log PORT_APPROVE with selected/pruned counts.
+2.7 Execution / OMS
+Purpose: The only component that talks to the broker; reconciles state.
+Responsibilities:
+Place/modify/cancel orders; attach brackets (two-step when StopLevel prevents attach).
+Reconcile orders &amp; positions; emit snapshots and real-time events.
+Retry on transient errors; classify fatal errors; final pre-send spread check.
+Inputs:
+ApprovedIntent[]
+PM requests: Close, Reverse, ModifySL, CancelPending, RearmBrackets.
+Outputs:
+OrderEvent
+FillEvent
+PositionSnapshot
+OrderSnapshot
+ReconciliationReport
+Rules &amp; Guarantees:
+All public methods guard on Kernel Kill flag; return REJECTED_KILL_ACTIVE when active.
+Single source of truth for positions/orders; State Manager consumes events/snapshots.
+Implementation Notes:
+Reconcile(): compare broker vs cache; adopt orphaned, purge ghosts, accept external SL/TP changes; report breakCount.
+PlaceEntryWithBracket(): StopLevel check → place → poll fill ≤ 2s → attach SL/TP if missing; return bracket_status OK|DEFERRED|FAILED.
+Retry taxonomy: retry ≤3 with 200ms backoff on REQUOTE/PRICE_OFF/TIMEOUT; fatal abort on INVALID_STOPS/INVALID_VOLUME/NO_MONEY; accept PARTIAL_FILL.
+Health probe: measure SymbolInfoTick latency; if &gt;2000ms, mark State.Health=DEGRADED; log HEALTH_LATENCY_WARN.
+2.8 Position Manager (sole owner of exits &amp; modifications)
+Purpose: Manage everything about open trades: exits, reversals, trailing, BE, time exits, housekeeping.
+Responsibilities:
+Precedence: Forced (kill/session end/error-storm) → Strategy exit/reverse → Trail/BE/Time → Housekeeping (TTL cancel, bracket re-arm).
+Build action queue atomically; execute sequentially with reconcile after each; lock symbol during management.
+Guardrails: tighten-only, MinMovePts, throttle (ModifyThrottleSec &amp; MaxModPerMin), freeze/stop-level safety, spread-aware.
+Inputs:
+PositionSnapshot (Execution)
+Bars/Ticks/ATR/Spread (Market Data &amp; Platform)
+ExitAdvice / ReverseAdvice (Exit Signal Generator)
+HealthFlags (State Manager)
+Outputs:
+Requests to Execution: Close, Reverse (close→open), ModifySL, CancelPending, RearmBrackets
+2.8.1 Exit Executor (sub-block of Position Manager)
+Purpose: Execute all exit and reverse actions, including forced exits and strategy-advised exits/reversals.
+Responsibilities:
+Handle forced exits immediately (Kill, end-of-session flatten, error-storm).
+Process strategy ExitAdvice/ReverseAdvice with precedence over trailing.
+Reverse semantics: NETTING = close then open; HEDGING = configurable allowHedging else close then open.
+Ensure idempotency (avoid duplicate closes); wait for confirmation events; reconcile after each action.
+Check Kill before each action; abort with REJECTED_KILL_ACTIVE if active.
+Inputs:
+PositionSnapshot (Execution)
+ExitAdvice / ReverseAdvice (Exit SG)
+HealthFlags (State Manager)
+Spread/SessionStatus (Market)
+Outputs:
+Execution requests: ClosePosition, ReversePosition (close→open), CancelPending (when replacing orders)
+Rules &amp; Guarantees:
+Forced exits supersede all other actions.
+Reverse actions are serialized: close must confirm before open in NETTING mode.
+Events logged: PM_EXIT_FORCED, PM_EXIT_STRATEGY, PM_REVERSE.
+2.8.2 Trade Lifecycle Manager (sub-block of Position Manager)
+Purpose: Manage trailing stop, break-even, time-based exits, bracket re-arming, and pending TTL housekeeping.
+Responsibilities:
+Trailing modes: BE hop (at +R with buffer), ATR/Chandelier, Fixed-step, Percent, Structure (later).
+Tighten-only rule; compute candidate SL and apply MinMovePts &amp; throttle (ModifyThrottleSec, MaxModPerMin).
+Safety checks: freeze/stop-level distance, spread-aware limits, instrument step sizes.
+RearmBrackets: attach missing SL/TP after fill; retry with escalation after 3 failures (Emergency Exit or Emergency SL).
+CancelStale: enforce TTL for pending orders; request CancelPending when expired.
+Update per-position lastModifyTime and keep SL changes idempotent.
+Inputs:
+PositionSnapshot (Execution)
+Bars/Ticks/ATR/Spread &amp; InstrumentInfo (Market &amp; Platform)
+Config: Trail mode parameters, MinMovePts, ModifyThrottleSec, MaxModPerMin, Pending TTL
+Outputs:
+Execution requests: ModifySL, RearmBrackets, CancelPending
+Logs: PM_TRAIL_MOVE, PM_TRAIL_SKIP (Throttle|MinMove|Freeze|Spread), PM_TTL_CANCEL, PM_REARM_BRACKETS, PM_EMERGENCY_*
+2.9 State Manager
+Purpose: Central cache of metrics and health flags; never a second truth.
+Responsibilities:
+Maintain equity/balance/margin/DD%; connection &amp; error counters; derive HealthFlags (pause/kill suggestions, error-storm).
+Ingest Execution real-time events: OnOrderPlaced, OnFill, OnPositionClosed, OnSLTPModified, OnCancel.
+Provide immediate updates to Kernel/PM; still perform full ingest at start-of-loop Reconcile.
+Inputs:
+Execution snapshots &amp; events
+Account info via adapter
+Outputs:
+HealthFlags, summarized account/position metrics
+Rules &amp; Guarantees:
+Never contradict Execution; if mismatch detected, rely on next Reconcile().
+3. Verticals (Cross-cutting)
+3.1 Porting Layer (MQL5 Adapter)
+Purpose: Uniform, testable wrapper over MQL5 APIs; hides platform specifics.
+Responsibilities:
+CopyRates, symbol normalization, CTrade wrappers, Stop/Freeze levels, normalized error codes, account mode fetch.
+Outputs:
+Adapter calls used by Market, Execution, State
+Rules &amp; Guarantees:
+No business logic inside the adapter.
+3.2 Logger (Kernel sub-function, callable by all)
+Purpose: Single structured log function; consistent schema and sink.
+Responsibilities:
+Emit concise breadcrumbs with runId + key k=v pairs.
+Inputs:
+Events from all blocks
+Outputs:
+CSV/terminal lines suitable for debugging and post-run analysis
+Implementation Notes:
+Key events: GATE_SKIP, ENTRY_SIGNAL, EXIT_ADVICE, INTENT, APPROVED, ORDER_SUBMIT/REJECT, FILL, POSITION_UPDATE, PM_TRAIL_MOVE/SKIP, PM_EXIT/REVERSE, BRACKET_*, RECON_*, HEALTH_LATENCY_WARN, KILL, PAUSE_TOGGLE.
+4. Unified Runtime Workflow (per symbol, each tick/bar)
+Reconcile (Execution/OMS): compare broker vs cache; adopt/purge/accept SLTP changes; emit PositionSnapshot/OrderSnapshot + ReconciliationReport. State Manager ingests and updates HealthFlags immediately.
+Gates (Runtime Kernel): Kill → PM closes now via Execution → Reconcile → End; Pause/Spread/Session/Data fail → block new entries, still manage open trades.
+Manage Open Trades (Position Manager): lock symbol; gather PositionSnapshot, Market data, ExitAdvice, HealthFlags; build action queue (Forced → Strategy exit/reverse → Trail/BE/Time → Housekeeping). For each action: check Kill, execute via Execution, State updates via events, Reconcile; unlock.
+New Entries (if policy allows; e.g., flat): Entry SG → Risk → Portfolio → Execution (final spread check; two-step bracket if needed). Fills via Execution; PM adopts on next loop.
+Record &amp; Log: State Manager refreshes metrics; Logger records concise events.
+5. Message Vocabulary
+Market &amp; Platform → Bar, Tick, Spread, SessionStatus, InstrumentInfo, AccountMode
+Execution/OMS → OrderEvent, FillEvent, PositionSnapshot, OrderSnapshot, ReconciliationReport
+State Manager → HealthFlags (DD%, margin headroom, error-storm, connection)
+Exit SG → PM → ExitAdvice, ReverseAdvice
+Entry SG → Risk → EntrySignal[] → OrderIntent[]
+Portfolio → Execution → ApprovedIntent[]
+PM → Execution → Close, Reverse (close→open), ModifySL, CancelPending, RearmBrackets
+6. Guardrails &amp; Test Scenarios
+Guardrails (enforced across blocks):
+Execution guards Kill at every entry point; PM checks Kill before each action.
+Trailing modify throttle (ModifyThrottleSec, MaxModPerMin) and MinMovePts to avoid spam/freeze rejections.
+Bracket gap protection via PlaceEntryWithBracket + PM.RearmBrackets with escalation after 3 failures.
+Order TTL enforced by PM housekeeping for pending orders.
+Retry taxonomy in Execution: retryable (≤3, 200ms) vs fatal abort; accept partial fills.
+Validation tests (run in Tester/live sandbox):
+Manual close via mobile: Reconcile adopts/purges; PM avoids trailing ghosts.
+StopLevel prevents attach: bracket deferred → PM re-arms → escalate on repeated failure.
+Reverse in NETTING vs HEDGING: verify configured behavior.
+Kill during trailing: actions rejected immediately; flatten succeeds; logs show sequence.
+Pending TTL expiry: PM cancels; logs PM_TTL_CANCEL.
+Throttle: frequent SL updates respected; PM_TRAIL_SKIP (Throttle/MinMove/Freeze/Spread) logged.
+Retry handling: REQUOTE/PRICE_OFF/TIMEOUT retried then aborted; fatal errors abort immediately.
+Portfolio pass-through: when flat, select top-confidence signal; when not flat, block entries.
+
+----- SHATrade_Interfaces.docx -----
+SHATrade — Block Interfaces (Single Source of Truth)
+Version: v1 • Generated: 2025-11-02 16:41
+Purpose
+This document defines the public interfaces for all SHATrade blocks. For each block it lists: 1) its own interfaces (what it exposes), 2) the dependent input interfaces it calls to get inputs, and 3) the dependent action/output interfaces it calls to execute actions or persist state.
+Conventions
+- Function names here are the stable contracts; internal helpers can change without breaking the contract.
+- DTOs/enums should remain backward compatible across MVP iterations.
+- Execution is the only block that touches broker order placement/modification.
+- Adapter encapsulates all direct platform calls (CopyRates/SymbolInfo/CTrade/etc.).
+- Shared contains pure helpers (no broker I/O, no market series fetching).
+Common Types (Return &amp; Health)
+enum RC { RC_OK=0, RC_SKIPPED=1, RC_RETRYABLE=2, RC_FATAL=3 }enum HealthFlag { HF_None=0, HF_SpreadTooWide=1, HF_ErrorStorm=2, HF_TradeContextBusy=3, HF_ReconcileMismatch=4, HF_SlippageExcessive=5 }struct RetInfo { RC code; int last_error; string msg; }
+KERNEL
+Files: Kernel/RuntimeKernel.mqh, Kernel.types.mqh, Kernel.inputs.mqh, Kernel/Logger.mqh
+Owns: Orchestration loop, gating, timer cadence, logging, safety sequencing.
+Types
+struct KernelContext { datetime now; string symbol; int timeframe; bool is_session_open; double spread; }
+1) Own Interfaces
+bool Kernel_Init();bool Kernel_Deinit();bool Kernel_Tick();bool Kernel_Timer();
+2) Dependent Inputs (READ)
+- Market_Snapshot(symbol, out)- Market_GetRates(symbol, tf, bars, out[])- Adapter_AccountInfo(equity, balance, margin_free)- PM_HasOpenPosition(symbol)- State_Get(out)
+3) Dependent Actions/Outputs (WRITE/ACT)
+- Signals_FindEntry(symbol, tf, out_sig)- Signals_AdviseExit(symbol, out_adv)- Risk_BuildOrder(rc, cand) -&gt; SizingDecision- Portfolio_Evaluate(symbol, cand, sz, ps) -&gt; PortfolioDecision- PM_EnqueueEntry(symbol, req, pol)- PM_ForceExit(symbol, reason, note)- Exec_Reconcile(out)- State_* (RecordExec/RecordExit/RecordError/SetHealth/IncTick)
+ADAPTER (MQL5 Wrappers)
+Files: Adapter/AdapterMQL5.mqh, Adapter.types.mqh
+Owns: All direct platform calls; normalizes retcodes and errors.
+Types
+struct SymbolMeta { int digits; double point; double tick_size; double tick_value; double lot_step; double min_lot; double max_lot; bool trading_allowed; }struct SendRequest { string symbol; ENUM_ORDER_TYPE type; double volume; double price; double sl; double tp; int deviation; ulong magic; string comment; }struct SendResult  { RetInfo ret; ulong order_ticket; ulong deal_ticket; double price_filled; }
+1) Own Interfaces
+bool  Adapter_SymbolMeta(const string symbol, SymbolMeta &amp;out);bool  Adapter_CopyRates(const string symbol, ENUM_TIMEFRAMES tf, int count, MqlRates &amp;rates[]);bool  Adapter_Spread(const string symbol, double &amp;out_points);bool  Adapter_SessionOpen(const string symbol, bool &amp;out_open);bool  Adapter_AccountInfo(double &amp;equity, double &amp;balance, double &amp;margin_free);RetInfo Adapter_Send(const SendRequest &amp;req, SendResult &amp;out);RetInfo Adapter_PositionModify(const string symbol, double sl, double tp);bool    Adapter_ListOpenPositions(const string symbol, ulong &amp;ticket_out);bool    Adapter_ListOpenOrders(const string symbol, ulong &amp;ticket_out);int     Adapter_LastError();
+2) Dependent Inputs (READ)
+Shared helpers only (pure math/util).
+3) Dependent Actions/Outputs (WRITE/ACT)
+Endpoint to broker/platform; no downstream calls.
+MARKET DATA &amp; PLATFORM VIEW
+Files: Market Data &amp; Platform/MarketDataPlatform.mqh, Market.types.mqh, Market.inputs.mqh
+Owns: Cached read-only view of symbol meta, spread, session, bars.
+Types
+struct MarketSnapshot { datetime time; double bid; double ask; double spread_pts; bool session_open; SymbolMeta meta; }
+1) Own Interfaces
+bool Market_InitSymbol(const string symbol, ENUM_TIMEFRAMES tf);bool Market_Snapshot(const string symbol, MarketSnapshot &amp;out);bool Market_GetRates(const string symbol, ENUM_TIMEFRAMES tf, int bars, MqlRates &amp;out[]);
+2) Dependent Inputs (READ)
+- Adapter_SymbolMeta(symbol, out_meta)- Adapter_Spread(symbol, out_points)- Adapter_SessionOpen(symbol, out_open)- Adapter_CopyRates(symbol, tf, count, out_rates[])
+3) Dependent Actions/Outputs (WRITE/ACT)
+None
+SIGNALS
+Files: Signals/EntrySignals.mqh, Signals/ExitSignals.mqh, Signals.types.mqh, Entry.inputs.mqh, Exit.inputs.mqh
+Owns: Entry detection &amp; exit advice (no volumes, no broker calls).
+Types
+enum EntrySide { ES_None=0, ES_Long=1, ES_Short=2 }struct EntrySignal { EntrySide side; double entry_price_hint; double sl_price_hint; double tp_price_hint; int strength_0_100; string strategy_tag; }enum ExitReason { XR_None=0, XR_Stop, XR_TakeProfit, XR_Trailing, XR_Time, XR_Reverse, XR_Manual }struct ExitAdvice { bool exit_now; ExitReason reason; double new_sl; double new_tp; }
+1) Own Interfaces
+bool Signals_FindEntry(const string symbol, ENUM_TIMEFRAMES tf, EntrySignal &amp;out_sig);bool Signals_AdviseExit(const string symbol, ExitAdvice &amp;out);
+2) Dependent Inputs (READ)
+- Market_Snapshot(symbol, out_snapshot)- Market_GetRates(symbol, tf, bars, out_rates[])- Shared math/utils
+3) Dependent Actions/Outputs (WRITE/ACT)
+None
+RISK
+Files: Risk/RiskManagement.mqh, Risk.types.mqh, Risk.inputs.mqh
+Owns: Position sizing, SL/TP templating, min RR checks.
+Types
+struct RiskContext { double equity; double risk_per_trade; double min_rr; double min_stop_pts; }struct OrderCandidate { string symbol; EntrySide side; double entry_price; double sl_price; double tp_price; }struct SizingDecision { RetInfo ret; double lots; double sl_price; double tp_price; double risk_r; }
+1) Own Interfaces
+SizingDecision Risk_BuildOrder(const RiskContext &amp;rc, const OrderCandidate &amp;c);
+2) Dependent Inputs (READ)
+- Adapter_AccountInfo(equity, balance, margin_free)- Market_Snapshot(symbol, out_snapshot)- Shared math/utils
+3) Dependent Actions/Outputs (WRITE/ACT)
+None
+PORTFOLIO
+Files: Portfolio/Portfolio.mqh, Portfolio.types.mqh, Portfolio.inputs.mqh
+Owns: Exposure constraints, concurrency, tie-break policy.
+Types
+struct PortfolioState { int open_positions; int max_concurrent; }enum PortfolioVerdict { PV_Reject=0, PV_Accept=1 }struct PortfolioDecision { PortfolioVerdict verdict; int priority; string reason; }
+1) Own Interfaces
+PortfolioDecision Portfolio_Evaluate(const string symbol, const OrderCandidate &amp;c, const SizingDecision &amp;sz, const PortfolioState &amp;ps);
+2) Dependent Inputs (READ)
+- PM_HasOpenPosition(symbol)- State_Get(out)- Adapter_AccountInfo(...)- Shared math/utils
+3) Dependent Actions/Outputs (WRITE/ACT)
+None
+EXECUTION (OMS)
+Files: Execution/ExecutionOMS.mqh, Execution.reconcile.mqh, Execution.brackets.mqh, Execution.retry.mqh, Execution.types.mqh, Execution.inputs.mqh
+Owns: Last-mile order send/modify, final gates, reconciliation.
+Types
+struct ExecPolicy { int deviation_pts; double max_spread_pts; ENUM_ORDER_TYPE_FILLING filling; }struct ExecRequest { OrderCandidate cand; double lots; double price; double sl; double tp; ulong magic; string comment; }struct ExecReport  { RetInfo ret; ulong deal_ticket; ulong order_ticket; double price_filled; }struct ReconcileReport { int open_positions; int open_orders; int mismatches; int error_count; bool healed; string notes; }
+1) Own Interfaces
+ExecReport Exec_PlaceEntry(const ExecPolicy &amp;pol, const ExecRequest &amp;req);RetInfo    Exec_AttachOrModify(const string symbol, double sl, double tp);bool       Exec_Reconcile(ReconcileReport &amp;out);
+2) Dependent Inputs (READ)
+- Market_Snapshot(symbol, out_snapshot)- Adapter_ListOpenPositions(symbol, ticket_out)- Adapter_ListOpenOrders(symbol, ticket_out)- State_Get(out)- Shared math/utils
+3) Dependent Actions/Outputs (WRITE/ACT)
+- Adapter_Send(req, out_result)- Adapter_PositionModify(symbol, sl, tp)
+POSITION MANAGER (Per-Symbol Coordinator)
+Files: PositionManager/PositionManager.mqh, PM.ExitExecutor.mqh, PM.TradeLifecycle.mqh, PM.types.mqh, PM.inputs.mqh
+Owns: Symbol lock, action queue, trailing/BE/time rules, forced exits.
+1) Own Interfaces
+bool   PM_Step(const string symbol);RetInfo PM_EnqueueEntry(const string symbol, const ExecRequest &amp;req, const ExecPolicy &amp;pol);RetInfo PM_ForceExit(const string symbol, ExitReason reason, string note);bool   PM_HasOpenPosition(const string symbol);
+2) Dependent Inputs (READ)
+- Signals_AdviseExit(symbol, out_advice)- Market_Snapshot(symbol, out_snapshot)- State_Get(out)- Adapter_ListOpenPositions(symbol, ticket)- Shared math/utils
+3) Dependent Actions/Outputs (WRITE/ACT)
+- Exec_PlaceEntry(pol, req)- Exec_AttachOrModify(symbol, sl, tp)- State_RecordExit(symbol, reason)- State_RecordError(ret)
+STATE
+Files: State/StateManager.mqh, State.types.mqh, State.inputs.mqh
+Owns: Telemetry counters, health flags, error storm tracking.
+Types
+struct Telemetry { int ticks_processed; int entries_sent; int exits_sent; double cum_pnl; int consecutive_errors; int reconcile_mismatches; HealthFlag hf; }
+1) Own Interfaces
+bool  State_Init();void  State_IncTick();void  State_RecordExec(const ExecReport &amp;r);void  State_RecordExit(const string symbol, ExitReason reason);void  State_RecordError(const RetInfo &amp;e);void  State_SetHealth(HealthFlag flag);bool  State_Get(Telemetry &amp;out);
+2) Dependent Inputs (READ)
+None
+3) Dependent Actions/Outputs (WRITE/ACT)
+None
+SHARED
+Files: Shared/TSB.ids.mqh, Shared/TSB.math.mqh, Shared/TSB.util.mqh
+Owns: Pure helpers &amp; constants (no I/O, no series access).
+Types
+namespace TSB {  ulong  MagicBase();  ulong  MagicFor(const string strategy_tag);  double RoundToStep(double value, double step);  double PointsToPrice(double points, double point, bool add);  double PriceToPoints(double from, double to, double point);  string TimeISO(datetime t);}
+1) Own Interfaces
+As above; keep pure and stateless.
+2) Dependent Inputs (READ)
+None
+3) Dependent Actions/Outputs (WRITE/ACT)
+None
+

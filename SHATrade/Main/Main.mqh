@@ -6,13 +6,17 @@
 #ifndef MAIN_MQH
 #define MAIN_MQH
 
+// NOTE: The include list is intentionally exhaustive so that every block's stub
+// interface is visible to Main.mq5. Most modules still carry TODOs because the
+// architecture document defines behaviour that has not yet been implemented.
+
 #include "..\\Include\\TradingBlocks\\Kernel\\RuntimeKernel.mqh"
 #include "..\\Include\\TradingBlocks\\Kernel\\Logger.mqh"
 #include "..\\Include\\TradingBlocks\\Kernel\\Kernel.types.mqh"
 #include "..\\Include\\TradingBlocks\\Kernel\\Kernel.inputs.mqh"
-#include "..\\Include\\TradingBlocks\\Market Data & Platform\\MarketDataPlatform.mqh"
-#include "..\\Include\\TradingBlocks\\Market Data & Platform\\Market.types.mqh"
-#include "..\\Include\\TradingBlocks\\Market Data & Platform\\Market.inputs.mqh"
+#include "..\\Include\\TradingBlocks\\MarketPlatform\\MarketDataPlatform.mqh"
+#include "..\\Include\\TradingBlocks\\MarketPlatform\\Market.types.mqh"
+#include "..\\Include\\TradingBlocks\\MarketPlatform\\Market.inputs.mqh"
 #include "..\\Include\\TradingBlocks\\Signals\\EntrySignals.mqh"
 #include "..\\Include\\TradingBlocks\\Signals\\ExitSignals.mqh"
 #include "..\\Include\\TradingBlocks\\Signals\\Signals.types.mqh"

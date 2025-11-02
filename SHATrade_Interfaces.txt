@@ -1,0 +1,200 @@
+﻿SHATrade — Block Interfaces (Single Source of Truth)
+Version: v1 • Generated: 2025-11-02 16:41
+Purpose
+This document defines the public interfaces for all SHATrade blocks. For each block it lists: 1) its own interfaces (what it exposes), 2) the dependent input interfaces it calls to get inputs, and 3) the dependent action/output interfaces it calls to execute actions or persist state.
+Conventions
+- Function names here are the stable contracts; internal helpers can change without breaking the contract.
+- DTOs/enums should remain backward compatible across MVP iterations.
+- Execution is the only block that touches broker order placement/modification.
+- Adapter encapsulates all direct platform calls (CopyRates/SymbolInfo/CTrade/etc.).
+- Shared contains pure helpers (no broker I/O, no market series fetching).
+Common Types (Return & Health)
+enum RC { RC_OK=0, RC_SKIPPED=1, RC_RETRYABLE=2, RC_FATAL=3 }
+enum HealthFlag { HF_None=0, HF_SpreadTooWide=1, HF_ErrorStorm=2, HF_TradeContextBusy=3, HF_ReconcileMismatch=4, HF_SlippageExcessive=5 }
+struct RetInfo { RC code; int last_error; string msg; }
+KERNEL
+Files: Kernel/RuntimeKernel.mqh, Kernel.types.mqh, Kernel.inputs.mqh, Kernel/Logger.mqh
+Owns: Orchestration loop, gating, timer cadence, logging, safety sequencing.
+Types
+struct KernelContext { datetime now; string symbol; int timeframe; bool is_session_open; double spread; }
+1) Own Interfaces
+bool Kernel_Init();
+bool Kernel_Deinit();
+bool Kernel_Tick();
+bool Kernel_Timer();
+2) Dependent Inputs (READ)
+- Market_Snapshot(symbol, out)
+- Market_GetRates(symbol, tf, bars, out[])
+- Adapter_AccountInfo(equity, balance, margin_free)
+- PM_HasOpenPosition(symbol)
+- State_Get(out)
+3) Dependent Actions/Outputs (WRITE/ACT)
+- Signals_FindEntry(symbol, tf, out_sig)
+- Signals_AdviseExit(symbol, out_adv)
+- Risk_BuildOrder(rc, cand) -> SizingDecision
+- Portfolio_Evaluate(symbol, cand, sz, ps) -> PortfolioDecision
+- PM_EnqueueEntry(symbol, req, pol)
+- PM_ForceExit(symbol, reason, note)
+- Exec_Reconcile(out)
+- State_* (RecordExec/RecordExit/RecordError/SetHealth/IncTick)
+ADAPTER (MQL5 Wrappers)
+Files: Adapter/AdapterMQL5.mqh, Adapter.types.mqh
+Owns: All direct platform calls; normalizes retcodes and errors.
+Types
+struct SymbolMeta { int digits; double point; double tick_size; double tick_value; double lot_step; double min_lot; double max_lot; bool trading_allowed; }
+struct SendRequest { string symbol; ENUM_ORDER_TYPE type; double volume; double price; double sl; double tp; int deviation; ulong magic; string comment; }
+struct SendResult  { RetInfo ret; ulong order_ticket; ulong deal_ticket; double price_filled; }
+1) Own Interfaces
+bool  Adapter_SymbolMeta(const string symbol, SymbolMeta &out);
+bool  Adapter_CopyRates(const string symbol, ENUM_TIMEFRAMES tf, int count, MqlRates &rates[]);
+bool  Adapter_Spread(const string symbol, double &out_points);
+bool  Adapter_SessionOpen(const string symbol, bool &out_open);
+bool  Adapter_AccountInfo(double &equity, double &balance, double &margin_free);
+RetInfo Adapter_Send(const SendRequest &req, SendResult &out);
+RetInfo Adapter_PositionModify(const string symbol, double sl, double tp);
+bool    Adapter_ListOpenPositions(const string symbol, ulong &ticket_out);
+bool    Adapter_ListOpenOrders(const string symbol, ulong &ticket_out);
+int     Adapter_LastError();
+2) Dependent Inputs (READ)
+Shared helpers only (pure math/util).
+3) Dependent Actions/Outputs (WRITE/ACT)
+Endpoint to broker/platform; no downstream calls.
+MARKET DATA & PLATFORM VIEW
+Files: Market Data & Platform/MarketDataPlatform.mqh, Market.types.mqh, Market.inputs.mqh
+Owns: Cached read-only view of symbol meta, spread, session, bars.
+Types
+struct MarketSnapshot { datetime time; double bid; double ask; double spread_pts; bool session_open; SymbolMeta meta; }
+1) Own Interfaces
+bool Market_InitSymbol(const string symbol, ENUM_TIMEFRAMES tf);
+bool Market_Snapshot(const string symbol, MarketSnapshot &out);
+bool Market_GetRates(const string symbol, ENUM_TIMEFRAMES tf, int bars, MqlRates &out[]);
+2) Dependent Inputs (READ)
+- Adapter_SymbolMeta(symbol, out_meta)
+- Adapter_Spread(symbol, out_points)
+- Adapter_SessionOpen(symbol, out_open)
+- Adapter_CopyRates(symbol, tf, count, out_rates[])
+3) Dependent Actions/Outputs (WRITE/ACT)
+None
+SIGNALS
+Files: Signals/EntrySignals.mqh, Signals/ExitSignals.mqh, Signals.types.mqh, Entry.inputs.mqh, Exit.inputs.mqh
+Owns: Entry detection & exit advice (no volumes, no broker calls).
+Types
+enum EntrySide { ES_None=0, ES_Long=1, ES_Short=2 }
+struct EntrySignal { EntrySide side; double entry_price_hint; double sl_price_hint; double tp_price_hint; int strength_0_100; string strategy_tag; }
+enum ExitReason { XR_None=0, XR_Stop, XR_TakeProfit, XR_Trailing, XR_Time, XR_Reverse, XR_Manual }
+struct ExitAdvice { bool exit_now; ExitReason reason; double new_sl; double new_tp; }
+1) Own Interfaces
+bool Signals_FindEntry(const string symbol, ENUM_TIMEFRAMES tf, EntrySignal &out_sig);
+bool Signals_AdviseExit(const string symbol, ExitAdvice &out);
+2) Dependent Inputs (READ)
+- Market_Snapshot(symbol, out_snapshot)
+- Market_GetRates(symbol, tf, bars, out_rates[])
+- Shared math/utils
+3) Dependent Actions/Outputs (WRITE/ACT)
+None
+RISK
+Files: Risk/RiskManagement.mqh, Risk.types.mqh, Risk.inputs.mqh
+Owns: Position sizing, SL/TP templating, min RR checks.
+Types
+struct RiskContext { double equity; double risk_per_trade; double min_rr; double min_stop_pts; }
+struct OrderCandidate { string symbol; EntrySide side; double entry_price; double sl_price; double tp_price; }
+struct SizingDecision { RetInfo ret; double lots; double sl_price; double tp_price; double risk_r; }
+1) Own Interfaces
+SizingDecision Risk_BuildOrder(const RiskContext &rc, const OrderCandidate &c);
+2) Dependent Inputs (READ)
+- Adapter_AccountInfo(equity, balance, margin_free)
+- Market_Snapshot(symbol, out_snapshot)
+- Shared math/utils
+3) Dependent Actions/Outputs (WRITE/ACT)
+None
+PORTFOLIO
+Files: Portfolio/Portfolio.mqh, Portfolio.types.mqh, Portfolio.inputs.mqh
+Owns: Exposure constraints, concurrency, tie-break policy.
+Types
+struct PortfolioState { int open_positions; int max_concurrent; }
+enum PortfolioVerdict { PV_Reject=0, PV_Accept=1 }
+struct PortfolioDecision { PortfolioVerdict verdict; int priority; string reason; }
+1) Own Interfaces
+PortfolioDecision Portfolio_Evaluate(const string symbol, const OrderCandidate &c, const SizingDecision &sz, const PortfolioState &ps);
+2) Dependent Inputs (READ)
+- PM_HasOpenPosition(symbol)
+- State_Get(out)
+- Adapter_AccountInfo(...)
+- Shared math/utils
+3) Dependent Actions/Outputs (WRITE/ACT)
+None
+EXECUTION (OMS)
+Files: Execution/ExecutionOMS.mqh, Execution.reconcile.mqh, Execution.brackets.mqh, Execution.retry.mqh, Execution.types.mqh, Execution.inputs.mqh
+Owns: Last-mile order send/modify, final gates, reconciliation.
+Types
+struct ExecPolicy { int deviation_pts; double max_spread_pts; ENUM_ORDER_TYPE_FILLING filling; }
+struct ExecRequest { OrderCandidate cand; double lots; double price; double sl; double tp; ulong magic; string comment; }
+struct ExecReport  { RetInfo ret; ulong deal_ticket; ulong order_ticket; double price_filled; }
+struct ReconcileReport { int open_positions; int open_orders; int mismatches; int error_count; bool healed; string notes; }
+1) Own Interfaces
+ExecReport Exec_PlaceEntry(const ExecPolicy &pol, const ExecRequest &req);
+RetInfo    Exec_AttachOrModify(const string symbol, double sl, double tp);
+bool       Exec_Reconcile(ReconcileReport &out);
+2) Dependent Inputs (READ)
+- Market_Snapshot(symbol, out_snapshot)
+- Adapter_ListOpenPositions(symbol, ticket_out)
+- Adapter_ListOpenOrders(symbol, ticket_out)
+- State_Get(out)
+- Shared math/utils
+3) Dependent Actions/Outputs (WRITE/ACT)
+- Adapter_Send(req, out_result)
+- Adapter_PositionModify(symbol, sl, tp)
+POSITION MANAGER (Per-Symbol Coordinator)
+Files: PositionManager/PositionManager.mqh, PM.ExitExecutor.mqh, PM.TradeLifecycle.mqh, PM.types.mqh, PM.inputs.mqh
+Owns: Symbol lock, action queue, trailing/BE/time rules, forced exits.
+1) Own Interfaces
+bool   PM_Step(const string symbol);
+RetInfo PM_EnqueueEntry(const string symbol, const ExecRequest &req, const ExecPolicy &pol);
+RetInfo PM_ForceExit(const string symbol, ExitReason reason, string note);
+bool   PM_HasOpenPosition(const string symbol);
+2) Dependent Inputs (READ)
+- Signals_AdviseExit(symbol, out_advice)
+- Market_Snapshot(symbol, out_snapshot)
+- State_Get(out)
+- Adapter_ListOpenPositions(symbol, ticket)
+- Shared math/utils
+3) Dependent Actions/Outputs (WRITE/ACT)
+- Exec_PlaceEntry(pol, req)
+- Exec_AttachOrModify(symbol, sl, tp)
+- State_RecordExit(symbol, reason)
+- State_RecordError(ret)
+STATE
+Files: State/StateManager.mqh, State.types.mqh, State.inputs.mqh
+Owns: Telemetry counters, health flags, error storm tracking.
+Types
+struct Telemetry { int ticks_processed; int entries_sent; int exits_sent; double cum_pnl; int consecutive_errors; int reconcile_mismatches; HealthFlag hf; }
+1) Own Interfaces
+bool  State_Init();
+void  State_IncTick();
+void  State_RecordExec(const ExecReport &r);
+void  State_RecordExit(const string symbol, ExitReason reason);
+void  State_RecordError(const RetInfo &e);
+void  State_SetHealth(HealthFlag flag);
+bool  State_Get(Telemetry &out);
+2) Dependent Inputs (READ)
+None
+3) Dependent Actions/Outputs (WRITE/ACT)
+None
+SHARED
+Files: Shared/TSB.ids.mqh, Shared/TSB.math.mqh, Shared/TSB.util.mqh
+Owns: Pure helpers & constants (no I/O, no series access).
+Types
+namespace TSB {
+ ulong  MagicBase();
+ ulong  MagicFor(const string strategy_tag);
+ double RoundToStep(double value, double step);
+ double PointsToPrice(double points, double point, bool add);
+ double PriceToPoints(double from, double to, double point);
+ string TimeISO(datetime t);
+}
+1) Own Interfaces
+As above; keep pure and stateless.
+2) Dependent Inputs (READ)
+None
+3) Dependent Actions/Outputs (WRITE/ACT)
+None

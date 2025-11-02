@@ -5,6 +5,6 @@
 #ifndef ENTRY_INPUTS_MQH
 #define ENTRY_INPUTS_MQH
 
-// TODO: implement entry.inputs.
+input int INP_EntryStrengthThreshold = 60;
 
 #endif // ENTRY_INPUTS_MQH

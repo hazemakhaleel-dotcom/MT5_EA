@@ -5,6 +5,6 @@
 #ifndef PORTFOLIO_INPUTS_MQH
 #define PORTFOLIO_INPUTS_MQH
 
-// TODO: implement portfolio.inputs.
+input int INP_PortfolioMaxConcurrent = 1; // TODO: expose tie-break policy + multi-position configs.
 
 #endif // PORTFOLIO_INPUTS_MQH

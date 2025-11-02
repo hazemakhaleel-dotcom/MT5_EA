@@ -5,6 +5,6 @@
 #ifndef EXIT_INPUTS_MQH
 #define EXIT_INPUTS_MQH
 
-// TODO: implement exit.inputs.
+input int INP_ExitMaxHoldBars = 240;
 
 #endif // EXIT_INPUTS_MQH

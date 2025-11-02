@@ -5,6 +5,6 @@
 #ifndef STATE_INPUTS_MQH
 #define STATE_INPUTS_MQH
 
-// TODO: implement state.inputs.
+input bool INP_StateLogTelemetry = true; // TODO: feed into logger/diagnostics once implemented.
 
 #endif // STATE_INPUTS_MQH
