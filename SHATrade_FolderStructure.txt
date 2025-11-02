@@ -1,0 +1,78 @@
+SHATrade/
+├─ Main/
+│     ├─ Main.mq5
+│     ├─ Profiles/                     # optional .set presets
+│     │  └─ *.set
+│     └─ README.txt                    # optional
+│
+├─ Include/
+│  └─ TradingBlocks/
+│     ├─ Kernel/
+│     │  ├─ RuntimeKernel.mqh          # orchestrates loop + gates; owns Logger()
+│     │  ├─ Logger.mqh                 # tiny logger function (Kernel sub-fn)
+│     │  ├─ Kernel.types.mqh
+│     │  └─ Kernel.inputs.mqh          # kernel-level inputs (pause/kill defaults, etc.)
+│     │
+│     ├─ Market Data & Platform/
+│     │  ├─ MarketDataPlatform.mqh     # bars/ticks/spread/session; no broker state
+│     │  ├─ Market.types.mqh
+│     │  └─ Market.inputs.mqh          # session windows, sampling (if any)
+│     │
+│     ├─ Signals/
+│     │  ├─ EntrySignals.mqh
+│     │  ├─ ExitSignals.mqh
+│     │  ├─ Signals.types.mqh
+│     │  ├─ Entry.inputs.mqh           # entry strategy tunables
+│     │  └─ Exit.inputs.mqh            # exit adviser tunables (if used)
+│     │
+│     ├─ Risk/
+│     │  ├─ RiskManagement.mqh
+│     │  ├─ Risk.types.mqh
+│     │  └─ Risk.inputs.mqh            # risk %, SL/TP templates, minRR, TTL
+│     │
+│     ├─ Portfolio/
+│     │  ├─ Portfolio.mqh
+│     │  ├─ Portfolio.types.mqh
+│     │  └─ Portfolio.inputs.mqh       # MaxConcurrentPositions, tie-break policy
+│     │
+│     ├─ Execution/
+│     │  ├─ ExecutionOMS.mqh           # broker I/O, final spread check
+│     │  ├─ Execution.reconcile.mqh    # Reconcile() + report DTO
+│     │  ├─ Execution.brackets.mqh     # two-step attach & re-arm helpers
+│     │  ├─ Execution.retry.mqh        # retry/backoff helpers
+│     │  ├─ Execution.types.mqh
+│     │  └─ Execution.inputs.mqh       # slippage/deviation, filling mode, spread caps
+│     │
+│     ├─ PositionManager/
+│     │  ├─ PositionManager.mqh        # coordinator: locks symbol, runs action queue
+│     │  ├─ PM.ExitExecutor.mqh        # forced & strategy exits/reversals
+│     │  ├─ PM.TradeLifecycle.mqh      # trailing/BE/time, bracket re-arm, TTL cancel
+│     │  ├─ PM.types.mqh
+│     │  └─ PM.inputs.mqh              # BE/ATR/fixed trailing params, throttle, MinMovePts
+│     │
+│     ├─ State/
+│     │  ├─ StateManager.mqh           # metrics & HealthFlags; event-driven updates
+│     │  ├─ State.types.mqh
+│     │  └─ State.inputs.mqh           # optional thresholds (DD%, error-storm) if user-tunable
+│     │
+│     ├─ Adapter/
+│     │  ├─ AdapterMQL5.mqh            # wrappers for CopyRates/SymbolInfo/CTrade; normalize errors
+│     │  └─ Adapter.types.mqh
+│     │
+│     └─ Shared/
+│        ├─ TSB.ids.mqh                # magic ranges, runId seeds
+│        ├─ TSB.math.mqh               # ATR/round-to-step helpers
+│        └─ TSB.util.mqh               # time/strings/maps (optional)
+│
+├─ Files/
+│     ├─ logs/                         # if using file sink
+│     ├─ config/                       # optional external configs
+│     └─ exports/                      # optional tester exports
+│
+├─ Scripts/
+│     ├─ Test_Reconcile.mq5
+│     ├─ Test_PM_Trailing.mq5
+│     ├─ Test_Portfolio_TieBreak.mq5
+│     └─ Test_Adapter_SymbolInfo.mq5
+│
+└─ Presets/                             # optional .set path (varies by platform)
